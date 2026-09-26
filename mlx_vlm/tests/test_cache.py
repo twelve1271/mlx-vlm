@@ -1658,6 +1658,134 @@ def test_admission_before_allocation(operation, memory_manager, monkeypatch):
     assert manager.stats.memory_skips >= 1
 
 
+def test_failed_admission_preserves_exact_cache(memory_manager, monkeypatch):
+    manager = memory_manager(budget=1 << 20)
+    tokens = list(range(32))
+    assert manager.store_exact_cache(tokens, [allocated(32)])
+    resident = manager.resident_bytes()
+    evictions = manager.stats.memory_evictions
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
+
+    assert not manager._make_room(resident + 1)
+    assert manager.resident_bytes() == resident
+    assert len(manager._exact_cache) == 1
+    assert manager.stats.memory_evictions == evictions
+
+
+def test_exact_restore_admission_preserves_selected_cache(memory_manager, monkeypatch):
+    manager = memory_manager(budget=1 << 20)
+    tokens = list(range(32))
+    assert manager.store_exact_cache(tokens, [allocated(32)])
+    resident = manager.resident_bytes()
+    evictions = manager.stats.memory_evictions
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 0)
+    monkeypatch.setattr(manager.memory_plan, "restore_bytes", lambda *args: 1)
+    monkeypatch.setattr(manager.memory_plan, "reserve_bytes", lambda *args: 1)
+
+    assert manager.lookup_exact_cache(tokens + [99]) == (None, 0)
+    assert manager.resident_bytes() == resident
+    assert len(manager._exact_cache) == 1
+    assert manager.stats.memory_evictions == evictions
+
+
+def test_exact_prefix_plan_includes_disk_index(memory_manager):
+    manager = memory_manager()
+    manager._exact_cache_max = 0
+    manager._disk_min_free_ram_bytes = 0
+    manager.disk = Mock()
+    manager.disk.find_exact_prefix.return_value = (1, 32)
+
+    assert manager.exact_prefix_plan(list(range(33))) == (32, None)
+    manager.disk.find_exact_prefix.assert_called_once()
+
+
+def test_exact_prefix_plan_releases_shorter_memory_protection(memory_manager):
+    manager = memory_manager()
+    assert manager.store_exact_cache(list(range(32)), [allocated(32)])
+    manager._disk_min_free_ram_bytes = 0
+    manager.disk = Mock()
+    manager.disk.find_exact_prefix.return_value = (1, 48)
+
+    assert manager.exact_prefix_plan(list(range(49))) == (48, None)
+
+
+def test_exact_lookup_plans_prefix_before_clone(memory_manager, monkeypatch):
+    manager = memory_manager(budget=1 << 20)
+    tokens = list(range(32))
+    source = C.ArraysCache(1)
+    source[0] = mx.ones((1, 32))
+    mx.eval(source.state)
+    assert manager.store_exact_cache(tokens, [source])
+    coordinator = coordinate(manager, [source])
+    coordinator.prepare_prefill(33, evict=False)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
+    original_clone = P._clone_prompt_cache_for_apc
+    admission_prefixes = []
+
+    def observed_clone(*args, **kwargs):
+        admission_prefixes.append(list(manager.memory_plan.prefix_lengths))
+        return original_clone(*args, **kwargs)
+
+    monkeypatch.setattr(P, "_clone_prompt_cache_for_apc", observed_clone)
+    hit = coordinator.lookup(
+        tokens + [99],
+        extra_hash=0,
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+
+    assert hit and hit["prefix_len"] == 32
+    assert admission_prefixes == [[32]]
+
+
+def test_exact_lookup_many_plans_prefixes_before_admission(memory_manager, monkeypatch):
+    manager = memory_manager(budget=1 << 20)
+    tokens = list(range(32))
+    source = C.ArraysCache(1)
+    source[0] = mx.ones((1, 32))
+    mx.eval(source.state)
+    assert manager.store_exact_cache(tokens, [source])
+    coordinator = coordinate(manager, [source])
+    request = tokens + [99]
+    coordinator.prepare_prefill([len(request), len(request)], evict=False)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
+    original_clone = P._clone_prompt_cache_for_apc
+    admission_prefixes = []
+
+    def observed_clone(*args, **kwargs):
+        admission_prefixes.append(list(manager.memory_plan.prefix_lengths))
+        return original_clone(*args, **kwargs)
+
+    monkeypatch.setattr(P, "_clone_prompt_cache_for_apc", observed_clone)
+    picks = coordinator.lookup_many(
+        [
+            (
+                request,
+                {
+                    "extra_hash": 0,
+                    "safe_lookup_min": 0,
+                    "suffix_is_text_only": lambda _: True,
+                    "prefix_has_media": lambda _: False,
+                },
+            ),
+            (
+                request,
+                {
+                    "extra_hash": 0,
+                    "safe_lookup_min": 0,
+                    "suffix_is_text_only": lambda _: False,
+                    "prefix_has_media": lambda _: False,
+                },
+            ),
+        ]
+    )
+
+    assert [pick["prefix_len"] if pick else 0 for pick in picks] == [32, 0]
+    assert admission_prefixes and all(plan == [32, 0] for plan in admission_prefixes)
+    assert manager.memory_plan.prefix_lengths == [32, 0]
+
+
 def test_accounting_and_eviction(memory_manager, monkeypatch):
     cache = NS(
         state={"kv": mx.ones((2, 3)), "nested": [mx.zeros((4,))]},
