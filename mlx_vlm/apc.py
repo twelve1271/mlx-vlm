@@ -3633,7 +3633,6 @@ class APCManager:
             and self._make_room(size, retain_bytes=size)
         )
         if not retain:
-            self._make_room()
             with self.lock:
                 self.stats.memory_skips += 1
             if self.disk is None:

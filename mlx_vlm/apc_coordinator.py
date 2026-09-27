@@ -183,8 +183,11 @@ class APCCoordinator:
         from .apc import apc_lookup_plan
 
         memory = self.manager.memory_plan
-        if self.is_checkpoint and len(memory.lengths) == 1 and memory.lengths[0] == len(
-            token_ids
+        protected_exact_keys = None
+        if (
+            self.is_checkpoint
+            and len(memory.lengths) == 1
+            and memory.lengths[0] == len(token_ids)
         ):
             prefix_len, protected_key = self._exact_prefix_plan(
                 token_ids,
@@ -192,13 +195,14 @@ class APCCoordinator:
                 safe_lookup_min=safe_lookup_min,
                 suffix_is_text_only=suffix_is_text_only,
             )
+            protected_exact_keys = (
+                {protected_key} if protected_key is not None and prefix_len else None
+            )
             self.prepare_prefill(
                 memory.lengths,
                 prefill_step_size=memory.chunk_size,
                 prefix_lengths=[prefix_len],
-                protected_exact_keys={protected_key}
-                if protected_key is not None and prefix_len
-                else None,
+                protected_exact_keys=protected_exact_keys,
             )
         hit = apc_lookup_plan(
             self.manager,
@@ -216,6 +220,7 @@ class APCCoordinator:
                 memory.lengths,
                 prefill_step_size=memory.chunk_size,
                 prefix_lengths=[hit["prefix_len"] if hit is not None else 0],
+                protected_exact_keys=protected_exact_keys if hit is not None else None,
             )
         return hit
 
@@ -242,6 +247,8 @@ class APCCoordinator:
         if not self.enabled:
             return [None] * len(requests)
         memory = self.manager.memory_plan
+        planned_exact_keys = [None] * len(requests)
+        protected_exact_keys = None
         if self.is_checkpoint and len(requests) == len(memory.lengths):
             plans = [
                 self._exact_prefix_plan(
@@ -252,25 +259,33 @@ class APCCoordinator:
                 )
                 for token_ids, kwargs in requests
             ]
+            planned_exact_keys = [
+                protected_key if prefix_len else None
+                for prefix_len, protected_key in plans
+            ]
+            protected_exact_keys = {
+                key for key in planned_exact_keys if key is not None
+            } or None
             self.prepare_prefill(
                 memory.lengths,
                 prefill_step_size=memory.chunk_size,
                 prefix_lengths=[prefix_len for prefix_len, _ in plans],
-                protected_exact_keys={
-                    protected_key
-                    for prefix_len, protected_key in plans
-                    if prefix_len and protected_key is not None
-                }
-                or None,
+                protected_exact_keys=protected_exact_keys,
             )
         hits = [self.lookup(token_ids, **kwargs) for token_ids, kwargs in requests]
         if len(requests) == len(memory.lengths):
+            protected_exact_keys = {
+                key
+                for key, hit in zip(planned_exact_keys, hits)
+                if key is not None and hit is not None
+            } or None
             self.prepare_prefill(
                 memory.lengths,
                 prefill_step_size=memory.chunk_size,
                 prefix_lengths=[
                     hit["prefix_len"] if hit is not None else 0 for hit in hits
                 ],
+                protected_exact_keys=protected_exact_keys,
             )
         return hits
 
