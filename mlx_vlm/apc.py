@@ -3275,11 +3275,12 @@ class APCManager:
             else max(prefill_reserve, allocation_bytes)
         )
         with self.lock:
+            headroom = self._memory_headroom()
             resident = self._resident_bytes_locked()
             protected = protected_exact_keys or set()
             target = min(
                 self.memory_max_bytes - retain_bytes,
-                resident + self._memory_headroom() - required,
+                resident + headroom - required,
             )
             reclaimable = sum(
                 _cache_nbytes(entry.prompt_cache)
@@ -3295,12 +3296,15 @@ class APCManager:
                 return False
             target = max(0, target)
             evicted = 0
+            evicted_bytes = 0
             while resident > target:
                 exact_key = next(
                     (key for key in self._exact_cache if key not in protected), None
                 )
                 if exact_key is not None:
-                    resident -= _cache_nbytes(self._exact_cache[exact_key].prompt_cache)
+                    released = _cache_nbytes(self._exact_cache[exact_key].prompt_cache)
+                    resident -= released
+                    evicted_bytes += released
                     del self._exact_cache[exact_key]
                 else:
                     block = self._free_head
@@ -3309,7 +3313,9 @@ class APCManager:
                     if block is None:
                         break
                     self._free_remove(block)
-                    resident -= block.resident_bytes()
+                    released = block.resident_bytes()
+                    resident -= released
+                    evicted_bytes += released
                     self.hash_table.pop(block.block_hash, None)
                     block.block_hash = None
                     block.token_ids = ()
@@ -3318,11 +3324,11 @@ class APCManager:
                 self.stats.evictions += 1
                 self.stats.memory_evictions += 1
                 evicted += 1
-        if evicted or self._memory_headroom() < required:
+        if evicted or headroom < required:
             mx.clear_cache()
         return (
             resident + retain_bytes <= self.memory_max_bytes
-            and self._memory_headroom() >= required
+            and headroom + evicted_bytes >= required
         )
 
     def prepare_prefill(

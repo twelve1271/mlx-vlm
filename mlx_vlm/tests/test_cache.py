@@ -1689,6 +1689,26 @@ def test_failed_exact_store_admission_preserves_prior_cache(
     assert manager.stats.memory_evictions == evictions
 
 
+def test_replacement_store_keeps_a_usable_prefix_when_headroom_drops(
+    memory_manager, monkeypatch
+):
+    manager = memory_manager(budget=1 << 20)
+    prior_tokens = list(range(32))
+    replacement_tokens = list(range(40))
+    assert manager.store_exact_cache(prior_tokens, [allocated(32)])
+    manager.memory_plan.prepare([40], prefix_lengths=[32])
+    headroom = iter((2000, 0))
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: next(headroom))
+
+    assert manager.store_exact_cache(replacement_tokens, [allocated(40)])
+    assert manager.stats.memory_evictions == 1
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
+    restored, count = manager.lookup_exact_cache(replacement_tokens + [99])
+
+    assert restored is not None
+    assert count == len(replacement_tokens)
+
+
 def test_exact_restore_admission_preserves_selected_cache(memory_manager, monkeypatch):
     manager = memory_manager(budget=1 << 20)
     tokens = list(range(32))
